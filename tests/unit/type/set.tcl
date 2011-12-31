@@ -207,6 +207,14 @@ start_server {
             assert_equal {3} [lsort [r sdiff myset1 myset2 myset3]]
         }
 
+        test "SDIFF which won't work because of iterator/remove bug" {
+            r del myset1
+            r sadd myset1 1 2 3 4 5 6 
+            r del myset3
+            r sadd myset3 1 2 3 4 5 6 7 8 9 10
+            assert_equal {} [lsort [r sdiff myset1 myset2 myset3]]
+        }
+
         test "SDIFFSTORE with three sets - $type" {
             r sdiffstore setres set1 set4 set5
             # The type is determined by type of the first key to diff against.
