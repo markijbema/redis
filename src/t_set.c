@@ -600,6 +600,106 @@ void sunionDiffGenericCommand(redisClient *c, robj **setkeys, int setnum, robj *
     zfree(sets);
 }
 
+void diffGenericCommand(redisClient *c, robj **setkeys, int setnum, robj *dstkey) {
+    robj **sets = zmalloc(sizeof(robj*)*setnum);
+    setTypeIterator *si;
+    robj *ele, *dstset = NULL;
+    int j, cardinality = 0;
+
+    for (j = 0; j < setnum; j++) {
+        robj *setobj = dstkey ?
+            lookupKeyWrite(c->db,setkeys[j]) :
+            lookupKeyRead(c->db,setkeys[j]);
+        if (!setobj) {
+            sets[j] = NULL;
+            continue;
+        }
+        if (checkType(c,setobj,REDIS_SET)) {
+            zfree(sets);
+            return;
+        }
+        sets[j] = setobj;
+    }
+
+    /* We need a temp set object to store our union. If the dstkey
+     * is not NULL (that is, we are inside an SUNIONSTORE operation) then
+     * this set object will be the resulting object to set into the target key*/
+    dstset = createIntsetObject();
+
+    /* Iterate all the sets */
+    for (j = 0; j < setnum; j++) {
+        if (j == 0 && !sets[j]) break; /* result set is empty */
+        if (!sets[j]) continue; /* non existing keys are like empty sets */
+
+        if (j == 0) {
+          /* initialize result with the elements of the first set */
+          si = setTypeInitIterator(sets[j]);
+          while((ele = setTypeNextObject(si)) != NULL) {
+
+                if (setTypeAdd(dstset,ele)) {
+                    cardinality++;
+                }
+                decrRefCount(ele);
+          }
+          setTypeReleaseIterator(si);
+        } else {
+            /* TODO the following condition is based only on order-of-magnitude considerations,
+             *      some constants may improve speed */
+            if (cardinality >= setTypeSize(sets[j])) {
+                /* if the set to be subtracted is smaller than the resultset,
+                 * iterate of the set to be subtracted, and remove each element */
+                si = setTypeInitIterator(sets[j]);
+                while((ele = setTypeNextObject(si)) != NULL) {
+                    if (setTypeRemove(dstset,ele)) {
+                        cardinality--;
+                    }
+                    decrRefCount(ele);
+                }
+                setTypeReleaseIterator(si);
+            } else {
+                /* if the resultset is smaller than the to-be-subtracted set, iterate
+                 * over the resultset, and check remove elements which are in the to-be-subtracted set */
+                si = setTypeInitIterator(dstset);
+                while((ele = setTypeNextObject(si)) != NULL) {
+                    if (setTypeIsMember(sets[j],ele) && setTypeRemove(dstset,ele)) {
+                        cardinality--;
+                    }
+                    decrRefCount(ele);
+                }
+                setTypeReleaseIterator(si);
+            }
+        }
+        /* Exit when result set is empty. */
+        if (cardinality == 0) break;
+    }
+
+    /* Output the content of the resulting set, if not in STORE mode */
+    if (!dstkey) {
+        addReplyMultiBulkLen(c,cardinality);
+        si = setTypeInitIterator(dstset);
+        while((ele = setTypeNextObject(si)) != NULL) {
+            addReplyBulk(c,ele);
+            decrRefCount(ele);
+        }
+        setTypeReleaseIterator(si);
+        decrRefCount(dstset);
+    } else {
+        /* If we have a target key where to store the resulting set
+         * create this key with the result set inside */
+        dbDelete(c->db,dstkey);
+        if (setTypeSize(dstset) > 0) {
+            dbAdd(c->db,dstkey,dstset);
+            addReplyLongLong(c,setTypeSize(dstset));
+        } else {
+            decrRefCount(dstset);
+            addReply(c,shared.czero);
+        }
+        signalModifiedKey(c->db,dstkey);
+        server.dirty++;
+    }
+    zfree(sets);
+}
+
 void sunionCommand(redisClient *c) {
     sunionDiffGenericCommand(c,c->argv+1,c->argc-1,NULL,REDIS_OP_UNION);
 }
@@ -609,9 +709,9 @@ void sunionstoreCommand(redisClient *c) {
 }
 
 void sdiffCommand(redisClient *c) {
-    sunionDiffGenericCommand(c,c->argv+1,c->argc-1,NULL,REDIS_OP_DIFF);
+    diffGenericCommand(c,c->argv+1,c->argc-1,NULL);
 }
 
 void sdiffstoreCommand(redisClient *c) {
-    sunionDiffGenericCommand(c,c->argv+2,c->argc-2,c->argv[1],REDIS_OP_DIFF);
+    diffGenericCommand(c,c->argv+2,c->argc-2,c->argv[1]);
 }
